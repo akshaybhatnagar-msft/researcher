@@ -1,0 +1,25 @@
+# API Server Dependencies
+fastapi>=0.103.1
+authlib>=1.5.2
+uvicorn>=0.23.2
+python-dotenv>=1.0.0
+requests>=2.31.0
+pydantic>=2.3.0
+python-jose>=3.3.0
+python-multipart>=0.0.6
+typing-extensions>=4.7.1
+
+# Azure AD Authentication
+msal>=1.24.0
+cryptography>=41.0.3
+
+# For Background Tasks
+asyncio>=3.4.3
+
+# For Production
+gunicorn>=21.2.0
+uvloop>=0.17.0; sys_platform != "win32"
+httptools>=0.6.0
+
+# Client Dependencies (if using the client.py script)
+msal>=1.24.0
