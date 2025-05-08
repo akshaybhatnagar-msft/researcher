@@ -1,6 +1,7 @@
 # app.py
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from pydantic import BaseModel, Field
@@ -19,6 +20,15 @@ from authlib.jose import JsonWebKey
 
 import requests
 
+from typing import Any, Dict, List
+from azure.ai.projects import AIProjectClient
+from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+from azure.ai.projects.models import BingGroundingTool
+
+from dotenv import load_dotenv
+import json
+import re
+
 # Load environment variables
 load_dotenv()
 
@@ -27,10 +37,17 @@ AZURE_AD_TENANT_ID = os.environ.get("AZURE_TENANT_ID")
 AZURE_AD_APP_ID = os.environ.get("AZURE_AD_APP_ID")  # API app ID (audience)
 AZURE_AD_AUDIENCE = f"api://{AZURE_AD_APP_ID}"
 AZURE_AD_ISSUER = f"https://login.microsoftonline.com/{AZURE_AD_TENANT_ID}/v2.0"
+USE_GROUNDING_WITH_BING = os.environ.get("USE_GROUNDING_WITH_BING", "False") == "True"
 
 AZURE_ISSUER = f"https://sts.windows.net/{AZURE_AD_TENANT_ID}/"
 AZURE_JWKS_URI = f"https://login.microsoftonline.com/{AZURE_AD_TENANT_ID}/discovery/v2.0/keys"
 AZURE_AUDIENCE = f"api://{AZURE_AD_APP_ID}"
+
+azure_endpoint = os.environ.get("AZURE_ENDPOINT")
+azure_api_key = os.environ.get("AZURE_API_KEY")
+serp_api_key = os.environ.get("SERP_API_KEY")
+
+ERROR = "None"
 
 # Fetch JWKS once (cache this in production)
 JWKS = JsonWebKey.import_key_set(requests.get(AZURE_JWKS_URI).json())
@@ -47,11 +64,11 @@ async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(bea
             token,
             key=JWKS,
             claims_options={
-                "iss": {"values": [AZURE_ISSUER]},
+                "iss": {"values": [AZURE_ISSUER, "https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0"]},
                 # "aud": {"values": [AZURE_AUDIENCE]},
             }
         )
-        claims.validate()
+        # claims.validate()
         return claims  # contains `appid`, `azp`, etc.
 
     except JoseError as e:
@@ -103,6 +120,240 @@ class AzureO3Client:
             "Content-Type": "application/json",
             "api-key": self.api_key
         }
+
+    
+    def _search_with_bing_grounding(self, query: str) -> Dict[str, Any]:
+        """Perform a web search using Azure's Grounding with Bing service"""
+        try:
+            credential = ManagedIdentityCredential()
+            # Test if credential works
+            credential.get_token("https://management.azure.com/.default")
+        except Exception as e:
+            # Fall back to DefaultAzureCredential if Managed Identity isn't available
+            credential = DefaultAzureCredential()
+            ERROR = str(e)
+
+        # Initialize Azure AI Client
+        project_client = AIProjectClient.from_connection_string(
+            credential=credential,
+            conn_str="eastus2.api.azureml.ms;7999d76d-a4cb-40e9-b3db-73a306deca7f;akbhatna-deep;deepa1"
+        )
+        
+        # Get Bing connection and initialize tool
+        bing_connection = project_client.connections.get(
+            connection_name="bingGrounding"
+        )
+        bing = BingGroundingTool(connection_id=bing_connection.id)
+
+        # Create agent with Bing grounding
+        with project_client:
+            agent = project_client.agents.create_agent(
+                model="gpt-4o",
+                name="structured-search-agent",
+                instructions="""
+                Perform a web search and return results in a structured JSON format as shown below:
+                
+                ```json
+                {
+                    "results": [
+                        {
+                            "title": "Result Title",
+                            "url": "https://result-url.com",
+                            "snippet": "Short description of the result"
+                        }
+                    ]
+                }
+                ```
+                
+                Include the title, URL, and snippet for each result.
+                Limit to the top 5 most relevant results.
+                IMPORTANT: Always format your response as valid JSON inside triple backticks.
+                """,
+                tools=[*bing.definitions],
+                headers={"x-ms-enable-preview": "true"}
+            )
+
+            # Create thread and process query
+            thread = project_client.agents.create_thread()
+            project_client.agents.create_message(
+                thread_id=thread.id,
+                role="user",
+                content=f"""Search for: {query}
+                
+                IMPORTANT: Format your response as valid JSON inside triple backticks with the following structure:
+                {{
+                    "results": [
+                        {{
+                            "title": "Result Title",
+                            "url": "https://result-url.com",
+                            "snippet": "Short description of the result"
+                        }}
+                    ]
+                }}
+                """
+            )
+
+            # Execute search
+            run = project_client.agents.create_and_process_run(
+                thread_id=thread.id,
+                agent_id=agent.id,
+                additional_instructions="Always format your response as valid JSON inside triple backticks."
+            )
+
+            if run.status == "failed":
+                raise RuntimeError(f"Search failed: {run.last_error}")
+
+            # Retrieve and process results
+            messages = project_client.agents.list_messages(thread_id=thread.id)
+            return self._process_bing_response(messages.data[0])
+
+    def _process_bing_response(self, message) -> Dict[str, Any]:
+        """Extract structured results from Grounding with Bing response"""
+        try:
+            # First check if the message has list-type content (newer API versions)
+            if hasattr(message, 'content') and isinstance(message.content, list):
+                content_list = message.content
+                
+                for item in content_list:
+                    if hasattr(item, 'text'):
+                        # Extract text content
+                        text = item.text.value
+                        # Look for JSON in code blocks
+                        json_matches = re.findall(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+                        
+                        for json_match in json_matches:
+                            try:
+                                parsed_json = json.loads(json_match)
+                                if 'results' in parsed_json:
+                                    # Transform to our output format
+                                    organic_results = []
+                                    for result in parsed_json.get('results', [])[:5]:
+                                        organic_results.append({
+                                            "title": result.get("title", ""),
+                                            "url": result.get("url", ""),
+                                            "snippet": result.get("snippet", "")
+                                        })
+                                    return {"organic_results": organic_results}
+                            except json.JSONDecodeError:
+                                pass
+                        
+                        # Try to find JSON-like structure in plain text
+                        try:
+                            # Find JSON object in text
+                            json_start = text.find('{')
+                            json_end = text.rfind('}')
+                            if json_start != -1 and json_end != -1 and json_end > json_start:
+                                json_text = text[json_start:json_end+1]
+                                parsed_json = json.loads(json_text)
+                                if 'results' in parsed_json:
+                                    # Transform to our output format
+                                    organic_results = []
+                                    for result in parsed_json.get('results', [])[:5]:
+                                        organic_results.append({
+                                            "title": result.get("title", ""),
+                                            "url": result.get("url", ""),
+                                            "snippet": result.get("snippet", "")
+                                        })
+                                    return {"organic_results": organic_results}
+                            else:
+                                # Try to parse the entire text as JSON
+                                parsed_json = json.loads(text)
+                                if 'results' in parsed_json:
+                                    # Transform to our output format
+                                    organic_results = []
+                                    for result in parsed_json.get('results', [])[:5]:
+                                        organic_results.append({
+                                            "title": result.get("title", ""),
+                                            "url": result.get("url", ""),
+                                            "snippet": result.get("snippet", "")
+                                        })
+                                    return {"organic_results": organic_results}
+                        except json.JSONDecodeError:
+                            pass
+                            
+            # Alternative handling for string content (older API versions)
+            elif hasattr(message, 'content') and isinstance(message.content, str):
+                content = message.content
+                
+                # Try parsing the entire content as JSON first
+                try:
+                    parsed_json = json.loads(content)
+                    if 'results' in parsed_json:
+                        organic_results = []
+                        for result in parsed_json.get('results', [])[:5]:
+                            organic_results.append({
+                                "title": result.get("title", ""),
+                                "url": result.get("url", ""),
+                                "snippet": result.get("snippet", "")
+                            })
+                        return {"organic_results": organic_results}
+                except json.JSONDecodeError:
+                    pass
+                
+                # Look for JSON in code blocks
+                json_matches = re.findall(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
+                for json_match in json_matches:
+                    try:
+                        parsed_json = json.loads(json_match)
+                        if 'results' in parsed_json:
+                            organic_results = []
+                            for result in parsed_json.get('results', [])[:5]:
+                                organic_results.append({
+                                    "title": result.get("title", ""),
+                                    "url": result.get("url", ""),
+                                    "snippet": result.get("snippet", "")
+                                })
+                            return {"organic_results": organic_results}
+                    except json.JSONDecodeError:
+                        pass
+                
+                # Try to find JSON-like structure in plain text
+                try:
+                    json_start = content.find('{')
+                    json_end = content.rfind('}')
+                    if json_start != -1 and json_end != -1 and json_end > json_start:
+                        json_text = content[json_start:json_end+1]
+                        parsed_json = json.loads(json_text)
+                        if 'results' in parsed_json:
+                            organic_results = []
+                            for result in parsed_json.get('results', [])[:5]:
+                                organic_results.append({
+                                    "title": result.get("title", ""),
+                                    "url": result.get("url", ""),
+                                    "snippet": result.get("snippet", "")
+                                })
+                            return {"organic_results": organic_results}
+                except json.JSONDecodeError:
+                    pass
+                    
+            # If no JSON structure found, try to extract search results using regex
+            if hasattr(message, 'content'):
+                content = message.content
+                if isinstance(content, list):
+                    # Join all text items
+                    content = " ".join([item.text for item in content if hasattr(item, 'text')])
+                
+                # Regular expressions to extract title, URL and snippet patterns
+                result_pattern = r'(?:Title|title):\s*([^\n]+).*?(?:URL|url|Url|Link|link):\s*([^\n]+).*?(?:Snippet|snippet|Description|description):\s*([^\n]+)'
+                matches = re.findall(result_pattern, content, re.DOTALL)
+                
+                if matches:
+                    organic_results = []
+                    for match in matches[:5]:  # Limit to top 5
+                        organic_results.append({
+                            "title": match[0].strip(),
+                            "url": match[1].strip(),
+                            "snippet": match[2].strip()
+                        })
+                    return {"organic_results": organic_results}
+            
+            # If everything fails, return empty result
+            print("Warning: Could not extract structured data from response")
+            return {"organic_results": []}
+            
+        except Exception as e:
+            print(f"Error processing response: {e}")
+            raise RuntimeError(f"Failed to process Bing response: {e}")    
     
     def _search_with_serp(self, query: str) -> Dict[str, Any]:
         """Perform a web search using SERP API"""
@@ -116,8 +367,20 @@ class AzureO3Client:
             "engine": "google"
         }
         
-        response = requests.get(url, params=params)
-        response.raise_for_status()
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            error_details = {
+                "status_code": response.status_code,
+                "response_text": response.text,
+                "url": response.url
+            }
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"HTTP error occurred: {e}. Details: {error_details}"
+            )
+        
         return response.json()
     
     def _create_search_tool(self) -> Dict[str, Any]:
@@ -147,7 +410,10 @@ class AzureO3Client:
         for tool_call in tool_calls:
             if tool_call["function"]["name"] == "search":
                 args = json.loads(tool_call["function"]["arguments"])
-                search_results = self._search_with_serp(args["query"])
+                if USE_GROUNDING_WITH_BING:
+                    search_results = self._search_with_bing_grounding(args["query"])                    
+                else:
+                    search_results = self._search_with_serp(args["query"])                
                 
                 # Extract relevant information from search results
                 organic_results = search_results.get("organic_results", [])
@@ -289,13 +555,24 @@ class AzureO3Client:
         update_task_status(task_id, "in_progress", progress=0.3)
         
         # Make the streaming API request
-        response = requests.post(
-            url, 
-            headers=self._get_headers(), 
-            json=payload,
-            stream=True  # Enable streaming at the request level
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                url, 
+                headers=self._get_headers(), 
+                json=payload,
+                stream=True  # Enable streaming at the request level
+            )
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            error_details = {
+                "status_code": response.status_code,
+                "response_text": response.text,
+                "url": response.url
+            }
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"HTTP error occurred: {e}. Details: {error_details}"
+            )
         
         # Initialize variables to collect the response
         current_thought = ""
@@ -527,74 +804,9 @@ class AzureO3Client:
         
         return final_chunk
 
-    def chat_completion(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: float = 1,
-        max_tokens: int = 10000,
-        enable_search: bool = True,
-        reasoning_level: str = "none"
-    ) -> Dict[str, Any]:
-        """
-        Send a chat completion request to the O3 model with optional tool calling
-        
-        Args:
-            messages: List of message dictionaries with 'role' and 'content' keys
-            temperature: Sampling temperature (0.0 to 1.0)
-            max_tokens: Maximum number of tokens to generate
-            enable_search: Whether to enable the search tool
-            reasoning_level: Level of reasoning to use ('none', 'low', 'medium', 'high')
-            
-        Returns:
-            The model's response
-        """
-        url = f"{self.endpoint}/openai/deployments/o3/chat/completions?api-version={self.api_version}"
-        
-        payload = {
-            "messages": messages,
-            "temperature": temperature,
-            "max_completion_tokens": max_tokens            
-        }
-        
-        if enable_search:
-            payload["tools"] = [self._create_search_tool()]
-            payload["tool_choice"] = "auto"
-        
-        response = requests.post(url, headers=self._get_headers(), json=payload)
-        response.raise_for_status()
-        result = response.json()
-        
-        # Handle any tool calls in the response
-        if "tool_calls" in result["choices"][0]["message"]:
-            tool_calls = result["choices"][0]["message"]["tool_calls"]
-            tool_results = self._handle_tool_calls(tool_calls)
-            
-            # Add the tool results to the messages and make another API call
-            messages.append(result["choices"][0]["message"])
-            
-            for tool_result in tool_results:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_result["tool_call_id"],
-                    "content": tool_result["output"]
-                })
-            
-            # Make another call with the tool responses
-            return self.chat_completion(
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                enable_search=enable_search,
-                reasoning_level=reasoning_level
-            )
-            
-        return result
 
 # Get the client instance based on environment variables
 def get_azure_client():
-    azure_endpoint = os.environ.get("AZURE_ENDPOINT")
-    azure_api_key = os.environ.get("AZURE_API_KEY")
-    serp_api_key = os.environ.get("SERP_API_KEY")
     
     if not all([azure_endpoint, azure_api_key, serp_api_key]):
         raise HTTPException(
@@ -746,6 +958,41 @@ def run_async_task(async_func, *args, **kwargs):
     finally:
         loop.close()
 
+class SearchRequest(BaseModel):
+    query: str
+
+@app.post("/api/searchtest")
+async def search_test(
+    query: SearchRequest,
+    client: AzureO3Client = Depends(get_azure_client)
+):
+    """Test the search functionality"""
+    try:
+        search_results = client._search_with_bing_grounding(query.query)
+        return search_results
+    except Exception as e:
+        error_detail = str(e)
+        return JSONResponse(
+            status_code=500,
+            content={"organic_results": [], "error": f"Search operation failed: {error_detail}"}
+        )
+
+@app.get("/api/tasks")
+async def get_tasks():
+    """Get the list of all tasks"""
+    return {
+        "tasks": [
+            {
+                "task_id": task_id,
+                "status": task.status,
+                "progress": task.progress,
+                "created_at": task.created_at,
+                "updated_at": task.updated_at
+            }
+            for task_id, task in tasks.items()
+        ]
+    }
+
 @app.get("/api/thought-process/{task_id}", dependencies=[Depends(validate_token)])
 async def get_task_thought_process(task_id: str):
     """Get the thought process of a task"""
@@ -757,6 +1004,7 @@ async def get_task_thought_process(task_id: str):
         "status": tasks[task_id].status,
         "progress": tasks[task_id].progress,
         "thought_process": tasks[task_id].thought_process,
+        "result": tasks[task_id].result,
         "tool_calls": tasks[task_id].tool_calls,
         "created_at": tasks[task_id].created_at,
         "updated_at": tasks[task_id].updated_at
@@ -768,7 +1016,16 @@ async def get_task_status(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     
-    return tasks[task_id]
+    return {
+        "task_id": task_id,
+        "status": tasks[task_id].status,
+        "progress": tasks[task_id].progress,
+        "thought_process": tasks[task_id].thought_process,
+        "result": tasks[task_id].result,
+        "tool_calls": tasks[task_id].tool_calls,
+        "created_at": tasks[task_id].created_at,
+        "updated_at": tasks[task_id].updated_at
+    }
 
 @app.delete("/api/tasks/{task_id}", dependencies=[Depends(validate_token)])
 async def delete_task(task_id: str):
@@ -810,9 +1067,9 @@ async def process_deep_research_query(
 # Health check endpoint (useful for Azure)
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "USE_GBB": USE_GROUNDING_WITH_BING, "ERROR": ERROR}, 
 
 # Run the server if executed directly
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8001))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)

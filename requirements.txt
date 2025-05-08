@@ -23,3 +23,7 @@ httptools>=0.6.0
 
 # Client Dependencies (if using the client.py script)
 msal>=1.24.0
+
+azure-ai-projects==1.0.0b7
+azure-core==1.32.0
+azure-identity==1.21.0
