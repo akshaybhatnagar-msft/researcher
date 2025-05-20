@@ -1,96 +1,11 @@
-# app.py
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
-import os
+# azure_client.py
 import json
 import requests
-import uvicorn
 import uuid
 from datetime import datetime
-from dotenv import load_dotenv
-
-
-from authlib.jose import jwt, JoseError
-from authlib.jose import JsonWebKey
-
-import requests
-
-from typing import Any, Dict, List
-from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
-from azure.ai.projects.models import BingGroundingTool
-
-from dotenv import load_dotenv
-import json
-import re
-
-# Load environment variables
-load_dotenv()
-
-# Azure AD configuration
-AZURE_AD_TENANT_ID = os.environ.get("AZURE_TENANT_ID")
-AZURE_AD_APP_ID = os.environ.get("AZURE_AD_APP_ID")  # API app ID (audience)
-AZURE_AD_AUDIENCE = f"api://{AZURE_AD_APP_ID}"
-AZURE_AD_ISSUER = f"https://login.microsoftonline.com/{AZURE_AD_TENANT_ID}/v2.0"
-USE_GROUNDING_WITH_BING = os.environ.get("USE_GROUNDING_WITH_BING", "False") == "True"
-
-AZURE_ISSUER = f"https://sts.windows.net/{AZURE_AD_TENANT_ID}/"
-AZURE_JWKS_URI = f"https://login.microsoftonline.com/{AZURE_AD_TENANT_ID}/discovery/v2.0/keys"
-AZURE_AUDIENCE = f"api://{AZURE_AD_APP_ID}"
-
-azure_endpoint = os.environ.get("AZURE_ENDPOINT")
-azure_api_key = os.environ.get("AZURE_API_KEY")
-serp_api_key = os.environ.get("SERP_API_KEY")
-
-ERROR = "None"
-
-# Fetch JWKS once (cache this in production)
-JWKS = JsonWebKey.import_key_set(requests.get(AZURE_JWKS_URI).json())
-
-# Bearer token parser
-bearer_scheme = HTTPBearer()
-
-# Token validation
-async def validate_token(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
-    token = credentials.credentials
-
-    try:
-        claims = jwt.decode(
-            token,
-            key=JWKS,
-            claims_options={
-                "iss": {"values": [AZURE_ISSUER, "https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0"]},
-                # "aud": {"values": [AZURE_AUDIENCE]},
-            }
-        )
-        # claims.validate()
-        return claims  # contains `appid`, `azp`, etc.
-
-    except JoseError as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {e}",
-        )
-
-class TaskStatus(BaseModel):
-    task_id: str
-    status: str  # "pending", "in_progress", "completed", "failed"
-    progress: float = 0.0  # 0.0 to 1.0
-    messages: List[Dict[str, Any]] = []
-    thought_process: List[Dict[str, Any]] = []  # New field to store reasoning steps
-    tool_calls: List[Dict[str, Any]] = []       # New field to track tool calls
-    result: Optional[Dict[str, Any]] = None
-    created_at: str
-    updated_at: str
-    error: Optional[str] = None
-
-# In-memory storage for tasks (replace with Redis or database in production)
-tasks = {}
+from typing import Dict, List, Any
+import os
+from fastapi import HTTPException
 
 class AzureO3Client:
     def __init__(
@@ -98,7 +13,8 @@ class AzureO3Client:
         endpoint: str,
         api_key: str,
         api_version: str = "2025-01-01-preview",
-        serp_api_key: str = None
+        serp_api_key: str = None,
+        storage_client = None
     ):
         """
         Initialize an Azure O3 client with SERP API search capability
@@ -108,11 +24,14 @@ class AzureO3Client:
             api_key: Azure AI Foundry API key
             api_version: API version to use
             serp_api_key: API key for SERP API (optional)
+            storage_client: TaskStorageClient instance for persistence
         """
         self.endpoint = endpoint.rstrip('/')
         self.api_key = api_key
         self.api_version = api_version
         self.serp_api_key = serp_api_key
+        self.storage_client = storage_client
+        self.use_grounding_with_bing = os.environ.get("USE_GROUNDING_WITH_BING", "False") == "True"
         
     def _get_headers(self) -> Dict[str, str]:
         """Get the headers required for API calls"""
@@ -124,91 +43,104 @@ class AzureO3Client:
     
     def _search_with_bing_grounding(self, query: str) -> Dict[str, Any]:
         """Perform a web search using Azure's Grounding with Bing service"""
-        try:
-            credential = ManagedIdentityCredential()
-            # Test if credential works
-            credential.get_token("https://management.azure.com/.default")
-        except Exception as e:
-            # Fall back to DefaultAzureCredential if Managed Identity isn't available
-            credential = DefaultAzureCredential()
-            ERROR = str(e)
-
-        # Initialize Azure AI Client
-        project_client = AIProjectClient.from_connection_string(
-            credential=credential,
-            conn_str="eastus2.api.azureml.ms;7999d76d-a4cb-40e9-b3db-73a306deca7f;akbhatna-deep;deepa1"
-        )
+        from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+        from azure.ai.projects import AIProjectClient
+        from azure.ai.projects.models import BingGroundingTool
+        import re
         
-        # Get Bing connection and initialize tool
-        bing_connection = project_client.connections.get(
-            connection_name="bingGrounding"
-        )
-        bing = BingGroundingTool(connection_id=bing_connection.id)
+        try:
+            try:
+                credential = ManagedIdentityCredential()
+                # Test if credential works
+                credential.get_token("https://management.azure.com/.default")
+            except Exception as e:
+                # Fall back to DefaultAzureCredential if Managed Identity isn't available
+                credential = DefaultAzureCredential()
+                print(f"Warning: Using DefaultAzureCredential due to: {str(e)}")
 
-        # Create agent with Bing grounding
-        with project_client:
-            agent = project_client.agents.create_agent(
-                model="gpt-4o",
-                name="structured-search-agent",
-                instructions="""
-                Perform a web search and return results in a structured JSON format as shown below:
-                
-                ```json
-                {
-                    "results": [
-                        {
-                            "title": "Result Title",
-                            "url": "https://result-url.com",
-                            "snippet": "Short description of the result"
-                        }
-                    ]
-                }
-                ```
-                
-                Include the title, URL, and snippet for each result.
-                Limit to the top 5 most relevant results.
-                IMPORTANT: Always format your response as valid JSON inside triple backticks.
-                """,
-                tools=[*bing.definitions],
-                headers={"x-ms-enable-preview": "true"}
+            # Initialize Azure AI Client
+            project_client = AIProjectClient.from_connection_string(
+                credential= credential,
+                conn_str="eastus2.api.azureml.ms;7999d76d-a4cb-40e9-b3db-73a306deca7f;akbhatna-deep;deepa1"
             )
-
-            # Create thread and process query
-            thread = project_client.agents.create_thread()
-            project_client.agents.create_message(
-                thread_id=thread.id,
-                role="user",
-                content=f"""Search for: {query}
-                
-                IMPORTANT: Format your response as valid JSON inside triple backticks with the following structure:
-                {{
-                    "results": [
-                        {{
-                            "title": "Result Title",
-                            "url": "https://result-url.com",
-                            "snippet": "Short description of the result"
-                        }}
-                    ]
-                }}
-                """
+            
+            # Get Bing connection and initialize tool
+            bing_connection = project_client.connections.get(
+                connection_name="bingGrounding"
             )
+            bing = BingGroundingTool(connection_id=bing_connection.id)
 
-            # Execute search
-            run = project_client.agents.create_and_process_run(
-                thread_id=thread.id,
-                agent_id=agent.id,
-                additional_instructions="Always format your response as valid JSON inside triple backticks."
-            )
+            # Create agent with Bing grounding
+            with project_client:
+                agent = project_client.agents.create_agent(
+                    model="gpt-4o",
+                    name="structured-search-agent",
+                    instructions="""
+                    Perform a web search and return results in a structured JSON format as shown below:
+                    
+                    ```json
+                    {
+                        "results": [
+                            {
+                                "title": "Result Title",
+                                "url": "https://result-url.com",
+                                "snippet": "Short description of the result"
+                            }
+                        ]
+                    }
+                    ```
+                    
+                    Include the title, URL, and snippet for each result.
+                    Limit to the top 5 most relevant results.
+                    IMPORTANT: Always format your response as valid JSON inside triple backticks.
+                    """,
+                    tools=[*bing.definitions],
+                    headers={"x-ms-enable-preview": "true"}
+                )
 
-            if run.status == "failed":
-                raise RuntimeError(f"Search failed: {run.last_error}")
+                # Create thread and process query
+                thread = project_client.agents.create_thread()
+                project_client.agents.create_message(
+                    thread_id=thread.id,
+                    role="user",
+                    content=f"""Search for: {query}
+                    
+                    IMPORTANT: Format your response as valid JSON inside triple backticks with the following structure:
+                    {{
+                        "results": [
+                            {{
+                                "title": "Result Title",
+                                "url": "https://result-url.com",
+                                "snippet": "Short description of the result"
+                            }}
+                        ]
+                    }}
+                    """
+                )
 
-            # Retrieve and process results
-            messages = project_client.agents.list_messages(thread_id=thread.id)
-            return self._process_bing_response(messages.data[0])
+                # Execute search
+                run = project_client.agents.create_and_process_run(
+                    thread_id=thread.id,
+                    agent_id=agent.id,
+                    additional_instructions="Always format your response as valid JSON inside triple backticks."
+                )
 
+                if run.status == "failed":
+                    raise RuntimeError(f"Search failed: {run.last_error}")
+
+                # Retrieve and process results
+                messages = project_client.agents.list_messages(thread_id=thread.id)
+                return self._process_bing_response(messages.data[0])
+
+        except Exception as e:
+            print(f"Error in Bing search: {e}")
+            raise HTTPException(status_code=500, detail=f"Bing search failed: {str(e)}")
+    
     def _process_bing_response(self, message) -> Dict[str, Any]:
         """Extract structured results from Grounding with Bing response"""
+        import re
+        import json
+        
         try:
             # First check if the message has list-type content (newer API versions)
             if hasattr(message, 'content') and isinstance(message.content, list):
@@ -331,7 +263,7 @@ class AzureO3Client:
                 content = message.content
                 if isinstance(content, list):
                     # Join all text items
-                    content = " ".join([item.text for item in content if hasattr(item, 'text')])
+                    content = " ".join([item.text.value for item in content if hasattr(item, 'text')])
                 
                 # Regular expressions to extract title, URL and snippet patterns
                 result_pattern = r'(?:Title|title):\s*([^\n]+).*?(?:URL|url|Url|Link|link):\s*([^\n]+).*?(?:Snippet|snippet|Description|description):\s*([^\n]+)'
@@ -353,7 +285,7 @@ class AzureO3Client:
             
         except Exception as e:
             print(f"Error processing response: {e}")
-            raise RuntimeError(f"Failed to process Bing response: {e}")    
+            raise RuntimeError(f"Failed to process Bing response: {e}")
     
     def _search_with_serp(self, query: str) -> Dict[str, Any]:
         """Perform a web search using SERP API"""
@@ -410,7 +342,7 @@ class AzureO3Client:
         for tool_call in tool_calls:
             if tool_call["function"]["name"] == "search":
                 args = json.loads(tool_call["function"]["arguments"])
-                if USE_GROUNDING_WITH_BING:
+                if self.use_grounding_with_bing:
                     search_results = self._search_with_bing_grounding(args["query"])                    
                 else:
                     search_results = self._search_with_serp(args["query"])                
@@ -420,7 +352,7 @@ class AzureO3Client:
                 simplified_results = [
                     {
                         "title": result.get("title"),
-                        "link": result.get("link"),
+                        "link": result.get("link", result.get("url")),
                         "snippet": result.get("snippet")
                     }
                     for result in organic_results[:5]  # Limit to top 5 results
@@ -435,48 +367,23 @@ class AzureO3Client:
     
     def add_thought_to_task(self, task_id: str, thought: str) -> None:
         """Add a thought process step to the task"""
-        if task_id not in tasks:
-            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-        
-        timestamp = datetime.now().isoformat()
-        
-        # Add the thought to the task's thought_process list
-        tasks[task_id].thought_process.append({
-            "timestamp": timestamp,
-            "content": thought
-        })
-        
-        # Update the task's timestamp
-        tasks[task_id].updated_at = timestamp
+        if self.storage_client:
+            # Store thought in Table Storage
+            result = self.storage_client.add_thought_to_task(task_id, thought)
+            if not result:
+                raise HTTPException(status_code=500, detail=f"Failed to add thought to task {task_id}")
+        else:
+            raise HTTPException(status_code=500, detail="Storage client not initialized")
 
     def add_tool_call_to_task(self, task_id: str, tool_call_data: Dict[str, Any]) -> None:
         """Add a tool call to the task"""
-        if task_id not in tasks:
-            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-        
-        timestamp = datetime.now().isoformat()
-        
-        # Add the tool call to the task's tool_calls list
-        # Build a map of existing tool calls by ID
-        existing_calls = {
-            call["data"][0]["id"]: call
-            for call in tasks[task_id].tool_calls
-            if call["data"]
-        }
-
-        # Now merge/overwrite with the new ones
-        for call in tool_call_data:
-            call_id = call["id"]
-            existing_calls[call_id] = {
-                "timestamp": timestamp,
-                "data": [call]
-            }
-
-        # Replace the tool_calls list with deduplicated values
-        tasks[task_id].tool_calls = list(existing_calls.values())
-        
-        # Update the task's timestamp
-        tasks[task_id].updated_at = timestamp
+        if self.storage_client:
+            # Store tool call in Table Storage
+            result = self.storage_client.add_tool_call_to_task(task_id, tool_call_data)
+            if not result:
+                raise HTTPException(status_code=500, detail=f"Failed to add tool call to task {task_id}")
+        else:
+            raise HTTPException(status_code=500, detail="Storage client not initialized")
     
     async def chat_completion_with_updates(
         self,
@@ -501,11 +408,14 @@ class AzureO3Client:
         Returns:
             The model's response
         """
+        from task_manager import update_task_status, update_task_messages
+        
         url = f"{self.endpoint}/openai/deployments/o3/chat/completions?api-version={self.api_version}"
         
         # Update task status to in_progress if not already
-        if tasks[task_id].status == "pending":
-            update_task_status(task_id, "in_progress", progress=0.1)
+        task = self.storage_client.get_task(task_id)
+        if task and task.get("status") == "pending":
+            update_task_status(task_id, "in_progress", progress=0.1, storage_client=self.storage_client)
         
         # Add a system instruction to include reasoning steps
         has_system_message = any(msg["role"] == "system" for msg in messages)
@@ -551,8 +461,8 @@ class AzureO3Client:
             payload["tool_choice"] = "auto"
         
         # Update task with the current messages
-        update_task_messages(task_id, messages)
-        update_task_status(task_id, "in_progress", progress=0.3)
+        update_task_messages(task_id, messages, storage_client=self.storage_client)
+        update_task_status(task_id, "in_progress", storage_client=self.storage_client)
         
         # Make the streaming API request
         try:
@@ -669,7 +579,7 @@ class AzureO3Client:
             tool_calls = final_response["choices"][0]["message"]["tool_calls"]
             
             # Update status to show we're processing tool calls
-            update_task_status(task_id, "in_progress", progress=0.6)
+            update_task_status(task_id, "in_progress", progress=0.6, storage_client=self.storage_client)
             self.add_thought_to_task(task_id, "Processing tool calls to retrieve additional information...")
             
             tool_results = self._handle_tool_calls(tool_calls)
@@ -680,7 +590,7 @@ class AzureO3Client:
                 "content": "",
                 "tool_calls": final_response["choices"][0]["message"]["tool_calls"]                
             })
-            update_task_messages(task_id, messages)
+            update_task_messages(task_id, messages, storage_client=self.storage_client)
             
             for tool_result in tool_results:
                 tool_result_content = tool_result["output"]
@@ -697,8 +607,8 @@ class AzureO3Client:
                 )
             
             # Update status to show we're continuing with tool results
-            update_task_status(task_id, "in_progress", progress=0.7)
-            update_task_messages(task_id, messages)
+            update_task_status(task_id, "in_progress", progress=0.7, storage_client=self.storage_client)
+            update_task_messages(task_id, messages, storage_client=self.storage_client)
             
             # Make another call with the tool responses
             return await self.chat_completion_with_updates(
@@ -711,11 +621,11 @@ class AzureO3Client:
             )
         else:
             # Update progress before completing
-            update_task_status(task_id, "in_progress", progress=0.9)
+            update_task_status(task_id, "in_progress", progress=0.9, storage_client=self.storage_client)
             self.add_thought_to_task(task_id, "Finalizing response and completing research task...")
             
         # Update task with final results
-        update_task_status(task_id, "completed", progress=1.0, result=final_response)
+        update_task_status(task_id, "completed", progress=1.0, result=final_response, storage_client=self.storage_client)
         return final_response
     
     def _construct_final_response(self, chunks):
@@ -803,273 +713,3 @@ class AzureO3Client:
         final_chunk["choices"][0]["message"] = final_message
         
         return final_chunk
-
-
-# Get the client instance based on environment variables
-def get_azure_client():
-    
-    if not all([azure_endpoint, azure_api_key, serp_api_key]):
-        raise HTTPException(
-            status_code=500, 
-            detail="Missing required environment variables. Please set AZURE_ENDPOINT, AZURE_API_KEY, and SERP_API_KEY."
-        )
-    
-    return AzureO3Client(
-        endpoint=azure_endpoint,
-        api_key=azure_api_key,
-        serp_api_key=serp_api_key
-    )
-
-# Helper functions for task management
-def create_task() -> str:
-    """Create a new task and return its ID"""
-    task_id = str(uuid.uuid4())
-    timestamp = datetime.now().isoformat()
-    tasks[task_id] = TaskStatus(
-        task_id=task_id,
-        status="pending",
-        progress=0.0,
-        messages=[],
-        thought_process=[],
-        tool_calls=[],
-        created_at=timestamp,
-        updated_at=timestamp
-    )
-    return task_id
-
-def update_task_status(task_id: str, status: str, progress: float = None, result: Dict[str, Any] = None, error: str = None) -> None:
-    """Update a task's status"""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    
-    timestamp = datetime.now().isoformat()
-    tasks[task_id].updated_at = timestamp
-    tasks[task_id].status = status
-    
-    if progress is not None:
-        tasks[task_id].progress = progress
-    
-    if result is not None:
-        tasks[task_id].result = result
-    
-    if error is not None:
-        tasks[task_id].error = error
-
-def update_task_messages(task_id: str, messages: List[Dict[str, Any]]) -> None:
-    """Update a task's messages"""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    
-    timestamp = datetime.now().isoformat()
-    tasks[task_id].updated_at = timestamp
-    tasks[task_id].messages = messages
-
-# Request models
-class Message(BaseModel):
-    role: str
-    content: str
-
-class ChatCompletionRequest(BaseModel):
-    messages: List[Message]
-    temperature: float = Field(default=1.0, ge=0.0, le=1.0)
-    max_tokens: int = Field(default=10000, gt=0)
-    enable_search: bool = Field(default=True)
-    reasoning_level: str = Field(default="none", pattern="^(none|low|medium|high)$")
-
-class QueryRequest(BaseModel):
-    query: str
-    system_prompt: Optional[str] = "You are a helpful assistant with access to web search capabilities."
-    temperature: float = Field(default=1.0, ge=0.0, le=1.0)
-    max_tokens: int = Field(default=10000, gt=0)
-    reasoning_level: str = Field(default="medium", pattern="^(none|low|medium|high)$")
-
-class TaskResponse(BaseModel):
-    task_id: str
-    status_url: str
-
-app = FastAPI(
-    title="Deep Research API",
-    description="API for performing deep research using Azure O3 with web search capabilities and real-time updates",
-    version="1.1.0"
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# API endpoints
-@app.get("/", dependencies=[Depends(validate_token)])
-async def root():
-    return {"message": "Welcome to the Deep Research API. See /docs for API documentation."}
-
-@app.post("/api/query", dependencies=[Depends(validate_token)], response_model=TaskResponse)
-async def query(
-    request: QueryRequest, 
-    background_tasks: BackgroundTasks,
-    client: AzureO3Client = Depends(get_azure_client)
-):
-    """Initiate a deep research query and return a task ID for polling the status"""
-    try:
-        # Create a new task
-        task_id = create_task()
-        
-        # Create messages from the query and system prompt
-        messages = [
-            {"role": "system", "content": request.system_prompt},
-            {"role": "user", "content": request.query}
-        ]
-        
-        # Update initial task status
-        update_task_messages(task_id, messages)
-        
-        # Launch the task in the background
-        background_tasks.add_task(
-            run_async_task,
-            process_deep_research_query,
-            client=client,
-            task_id=task_id,
-            messages=messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            reasoning_level=request.reasoning_level
-        )
-        
-        # Return the task ID and status URL for polling immediately
-        return {
-            "task_id": task_id,
-            "status_url": f"/api/status/{task_id}"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Helper function to run async tasks in background
-def run_async_task(async_func, *args, **kwargs):
-    """Helper function to run async functions in background tasks"""
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(async_func(*args, **kwargs))
-    finally:
-        loop.close()
-
-class SearchRequest(BaseModel):
-    query: str
-
-@app.post("/api/searchtest")
-async def search_test(
-    query: SearchRequest,
-    client: AzureO3Client = Depends(get_azure_client)
-):
-    """Test the search functionality"""
-    try:
-        search_results = client._search_with_bing_grounding(query.query)
-        return search_results
-    except Exception as e:
-        error_detail = str(e)
-        return JSONResponse(
-            status_code=500,
-            content={"organic_results": [], "error": f"Search operation failed: {error_detail}"}
-        )
-
-@app.get("/api/tasks")
-async def get_tasks():
-    """Get the list of all tasks"""
-    return {
-        "tasks": [
-            {
-                "task_id": task_id,
-                "status": task.status,
-                "progress": task.progress,
-                "created_at": task.created_at,
-                "updated_at": task.updated_at
-            }
-            for task_id, task in tasks.items()
-        ]
-    }
-
-@app.get("/api/thought-process/{task_id}", dependencies=[Depends(validate_token)])
-async def get_task_thought_process(task_id: str):
-    """Get the thought process of a task"""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    
-    return {
-        "task_id": task_id,
-        "status": tasks[task_id].status,
-        "progress": tasks[task_id].progress,
-        "thought_process": tasks[task_id].thought_process,
-        "result": tasks[task_id].result,
-        "tool_calls": tasks[task_id].tool_calls,
-        "created_at": tasks[task_id].created_at,
-        "updated_at": tasks[task_id].updated_at
-    }
-
-@app.get("/api/status/{task_id}", dependencies=[Depends(validate_token)])
-async def get_task_status(task_id: str):
-    """Get the status of a task"""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    
-    return {
-        "task_id": task_id,
-        "status": tasks[task_id].status,
-        "progress": tasks[task_id].progress,
-        "thought_process": tasks[task_id].thought_process,
-        "result": tasks[task_id].result,
-        "tool_calls": tasks[task_id].tool_calls,
-        "created_at": tasks[task_id].created_at,
-        "updated_at": tasks[task_id].updated_at
-    }
-
-@app.delete("/api/tasks/{task_id}", dependencies=[Depends(validate_token)])
-async def delete_task(task_id: str):
-    """Delete a task"""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    
-    del tasks[task_id]
-    return {"message": f"Task {task_id} deleted"}
-
-# Background task processor
-async def process_deep_research_query(
-    client: AzureO3Client,
-    task_id: str,
-    messages: List[Dict[str, str]],
-    temperature: float = 1.0,
-    max_tokens: int = 10000,
-    reasoning_level: str = "medium"
-):
-    """Process a deep research query in the background"""
-    try:
-        # Update the task messages
-        update_task_messages(task_id, messages)
-        
-        # Perform the deep research
-        response = await client.chat_completion_with_updates(
-            messages=messages,
-            task_id=task_id,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            enable_search=True,  # Always enable search for deep research
-            reasoning_level=reasoning_level
-        )
-        
-        # Task status is already updated in the chat_completion_with_updates method
-    except Exception as e:
-        update_task_status(task_id, "failed", error=str(e))
-
-# Health check endpoint (useful for Azure)
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "USE_GBB": USE_GROUNDING_WITH_BING, "ERROR": ERROR}, 
-
-# Run the server if executed directly
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8001))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)

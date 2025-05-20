@@ -5,7 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY src/ /app/src/
+COPY . /app/src/
+WORKDIR /app/src
 
 # Default port for the FastAPI app
 EXPOSE 8000
