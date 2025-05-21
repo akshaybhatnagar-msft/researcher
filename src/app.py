@@ -10,6 +10,7 @@ import uvicorn
 # Import our modules
 from models import QueryRequest, TaskResponse
 from storage_client import TaskStorageClient
+from hybrid_storage_client import HybridTaskStorageClient
 from azure_client import AzureO3Client
 from task_manager import (
     create_task, update_task_messages, 
@@ -54,8 +55,8 @@ async def lifespan(app: FastAPI):
         validate_config()
         
         # Initialize storage client with fallback option enabled
-        storage_client = TaskStorageClient(
-            table_name=AZURE_STORAGE_TABLE_NAME,            
+        storage_client = HybridTaskStorageClient(
+            table_name=AZURE_STORAGE_TABLE_NAME
         )
         
         # Initialize Azure client
@@ -128,7 +129,7 @@ async def query(
     queryRequest: QueryRequest, 
     background_tasks: BackgroundTasks,
     client: AzureO3Client = Depends(get_azure_client),
-    storage: TaskStorageClient = Depends(get_storage_client)
+    storage: HybridTaskStorageClient = Depends(get_storage_client)
 ):
     """Initiate a deep research query and return a task ID for polling the status"""
     try:
@@ -170,7 +171,7 @@ async def query(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/tasks", dependencies=[Depends(validate_token)])
-async def get_tasks(request: Request, storage: TaskStorageClient = Depends(get_storage_client)):
+async def get_tasks(request: Request, storage: HybridTaskStorageClient = Depends(get_storage_client)):
     """Get the list of all tasks"""
     created_by = request.state.claims.get("oid")
     if not created_by:
@@ -200,7 +201,7 @@ async def get_tasks(request: Request, storage: TaskStorageClient = Depends(get_s
 async def get_task_thought_process(
     request: Request,
     task_id: str, 
-    storage: TaskStorageClient = Depends(get_storage_client)
+    storage: HybridTaskStorageClient = Depends(get_storage_client)
 ):
     created_by = request.state.claims.get("oid")
     if not created_by:
@@ -223,7 +224,7 @@ async def get_task_thought_process(
 async def get_task_status(
     request: Request,
     task_id: str, 
-    storage: TaskStorageClient = Depends(get_storage_client)
+    storage: HybridTaskStorageClient = Depends(get_storage_client)
 ):
     """Get the status of a task"""
     task = get_task(task_id, storage_client=storage)
@@ -243,7 +244,7 @@ async def get_task_status(
 async def delete_task_endpoint(
     request: Request,
     task_id: str,
-    storage: TaskStorageClient = Depends(get_storage_client)
+    storage: HybridTaskStorageClient = Depends(get_storage_client)
 ):
     """Delete a task"""
     delete_task(task_id, storage_client=storage)

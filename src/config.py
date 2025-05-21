@@ -20,14 +20,22 @@ USE_GROUNDING_WITH_BING = os.environ.get("USE_GROUNDING_WITH_BING", "False") == 
 
 # Default credential for Azure
 def get_azure_credential():
+    isLocal = os.environ.get("IS_LOCAL", "true").lower() == "true"
     try:
-        credential = ManagedIdentityCredential()
-        # Test if credential works
-        credential.get_token("https://management.azure.com/.default")
+        if not isLocal:
+            # Only use ManagedIdentityCredential in non-local environments
+            credential = ManagedIdentityCredential()
+            # Test if credential works
+            credential.get_token("https://management.azure.com/.default")
+            print("Using ManagedIdentityCredential")
+        else:
+            # Use DefaultAzureCredential in local environment
+            credential = DefaultAzureCredential()
+            print("Using DefaultAzureCredential for local environment")
     except Exception as e:
         # Fall back to DefaultAzureCredential if Managed Identity isn't available
         credential = DefaultAzureCredential()
-        ERROR = str(e)
+        print(f"Warning: Using DefaultAzureCredential due to: {str(e)}")
 
 def validate_config():
     """Validate that required configuration is present"""

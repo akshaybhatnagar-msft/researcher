@@ -24,7 +24,7 @@ class AzureO3Client:
             api_key: Azure AI Foundry API key
             api_version: API version to use
             serp_api_key: API key for SERP API (optional)
-            storage_client: TaskStorageClient instance for persistence
+            storage_client: HybridTaskStorageClient instance for persistence
         """
         self.endpoint = endpoint.rstrip('/')
         self.api_key = api_key
@@ -49,10 +49,18 @@ class AzureO3Client:
         import re
         
         try:
+            isLocal = os.environ.get("IS_LOCAL", "true").lower() == "true"
             try:
-                credential = ManagedIdentityCredential()
-                # Test if credential works
-                credential.get_token("https://management.azure.com/.default")
+                if not isLocal:
+                    # Only use ManagedIdentityCredential in non-local environments
+                    credential = ManagedIdentityCredential()
+                    # Test if credential works
+                    credential.get_token("https://management.azure.com/.default")
+                    print("Using ManagedIdentityCredential")
+                else:
+                    # Use DefaultAzureCredential in local environment
+                    credential = DefaultAzureCredential()
+                    print("Using DefaultAzureCredential for local environment")
             except Exception as e:
                 # Fall back to DefaultAzureCredential if Managed Identity isn't available
                 credential = DefaultAzureCredential()
@@ -444,17 +452,22 @@ class AzureO3Client:
         # Add reasoning_level if supported by the API
         if reasoning_level and reasoning_level != "none":
             if reasoning_level == "high":
-                # Add explicit instructions for detailed reasoning
-                if has_system_message:
-                    for i, msg in enumerate(messages):
-                        if msg["role"] == "system":
-                            messages[i]["content"] += "\nPlease use extensive step-by-step reasoning, consider multiple perspectives, and be thorough in your analysis."
-                            break
-                else:
-                    messages.insert(0, {
-                        "role": "system", 
-                        "content": "Please use extensive step-by-step reasoning, consider multiple perspectives, and be thorough in your analysis."
-                    })
+                payload["reasoning_effort"] = "high"
+                # # Add explicit instructions for detailed reasoning
+                # if has_system_message:
+                #     for i, msg in enumerate(messages):
+                #         if msg["role"] == "system":
+                #             messages[i]["content"] += "\nPlease use extensive step-by-step reasoning, consider multiple perspectives, and be thorough in your analysis."
+                #             break
+                # else:
+                #     messages.insert(0, {
+                #         "role": "system", 
+                #         "content": "Please use extensive step-by-step reasoning, consider multiple perspectives, and be thorough in your analysis."
+                #     })
+            elif reasoning_level == "medium":
+                payload["reasoning_effort"] = "medium"
+            else:
+                payload["reasoning_effort"] = "low"
         
         if enable_search:
             payload["tools"] = [self._create_search_tool()]
@@ -579,7 +592,7 @@ class AzureO3Client:
             tool_calls = final_response["choices"][0]["message"]["tool_calls"]
             
             # Update status to show we're processing tool calls
-            update_task_status(task_id, "in_progress", progress=0.6, storage_client=self.storage_client)
+            update_task_status(task_id, "in_progress", progress=0.7, storage_client=self.storage_client)
             self.add_thought_to_task(task_id, "Processing tool calls to retrieve additional information...")
             
             tool_results = self._handle_tool_calls(tool_calls)

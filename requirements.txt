@@ -28,6 +28,7 @@ azure-ai-projects==1.0.0b7
 azure-core==1.32.0
 azure-identity==1.21.0
 azure-data-tables==12.5.0
+azure-storage-blob==12.25.1
 
 opentelemetry-api >= 1.10.0
 opentelemetry-sdk >= 1.10.0

@@ -1,4 +1,5 @@
 from azure.data.tables import TableServiceClient, TableClient
+from azure.storage.blob import BlobServiceClient, BlobClient
 from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
 from azure.core.exceptions import AzureError
 import json
@@ -10,20 +11,22 @@ from logging import getLogger
 
 logger = getLogger(__name__)
 
-class TaskStorageClient:
-    """Client for interacting with Azure Table Storage for task persistence"""
+class HybridTaskStorageClient:
+    """Client for interacting with Azure Table Storage and Blob Storage for task persistence"""
     
-    def __init__(self, table_name="DeepResearchTasks", max_retries=3, base_delay=1.0, max_delay=10.0):
+    def __init__(self, table_name="DeepResearchTasks", container_name="task-data", max_retries=3, base_delay=1.0, max_delay=10.0):
         """
         Initialize the storage client
         
         Args:
-            table_name: Name of the table to use for storing tasks
+            table_name: Name of the table to use for storing task metadata
+            container_name: Name of the blob container to use for storing large task data
             max_retries: Maximum number of retries for operations (default: 3)
             base_delay: Base delay for exponential backoff in seconds (default: 1.0)
             max_delay: Maximum delay between retries in seconds (default: 10.0)
         """
         self.table_name = table_name
+        self.container_name = container_name
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
@@ -48,20 +51,37 @@ class TaskStorageClient:
                 print(f"Warning: Using DefaultAzureCredential due to: {str(e)}")
 
             self.credential = credential
-            self.endpoint = os.environ.get("AZURE_STORAGE_TABLE_URL")
+            self.table_endpoint = os.environ.get("AZURE_STORAGE_TABLE_URL")
+            self.blob_endpoint = os.environ.get("AZURE_STORAGE_BLOB_URL")
             
-            logger.info(f"Initializing Table Storage client at endpoint: {self.endpoint}")
+            if not self.blob_endpoint:
+                # If blob endpoint not specified, try to derive it from table endpoint
+                if self.table_endpoint:
+                    # Replace "table" with "blob" in the endpoint
+                    self.blob_endpoint = self.table_endpoint.replace("table", "blob")
+                    logger.info(f"Derived blob endpoint: {self.blob_endpoint}")
+                else:
+                    raise ValueError("Either AZURE_STORAGE_BLOB_URL or AZURE_STORAGE_TABLE_URL must be provided")
+            
+            logger.info(f"Initializing Table Storage client at endpoint: {self.table_endpoint}")
+            logger.info(f"Initializing Blob Storage client at endpoint: {self.blob_endpoint}")
             
             self.table_service = TableServiceClient(
-                endpoint=self.endpoint,
+                endpoint=self.table_endpoint,
+                credential=self.credential
+            )
+            
+            self.blob_service = BlobServiceClient(
+                account_url=self.blob_endpoint,
                 credential=self.credential
             )
         except Exception as e:
             logger.error(f"Error initializing with Azure credentials: {e}", exc_info=True)
             raise
         
-        # Create the table if it doesn't exist
+        # Create the table and container if they don't exist
         self._create_table_if_not_exists()
+        self._create_container_if_not_exists()
     
     def _create_table_if_not_exists(self):
         """Create the tasks table if it doesn't exist"""
@@ -83,6 +103,24 @@ class TaskStorageClient:
             # Continue execution even if table creation fails
             # The table might already exist or might be created by another process
     
+    def _create_container_if_not_exists(self):
+        """Create the blob container if it doesn't exist"""
+        try:
+            # Check if the container exists
+            containers = list(self.blob_service.list_containers())
+            container_exists = any(container.name == self.container_name for container in containers)
+            
+            # If container doesn't exist, create it
+            if not container_exists:
+                logger.info(f"Creating blob container {self.container_name}...")
+                self.blob_service.create_container(self.container_name)
+                logger.info(f"Blob container {self.container_name} created successfully")
+            else:
+                logger.debug(f"Blob container {self.container_name} already exists")
+                
+        except Exception as e:
+            logger.warning(f"Error creating or checking blob container: {e}", exc_info=True)
+    
     def _get_table_client(self):
         """Get a table client for the tasks table"""
         try:
@@ -90,7 +128,7 @@ class TaskStorageClient:
                 return self.table_service.get_table_client(self.table_name)
             else:
                 return TableClient(
-                    endpoint=self.endpoint,
+                    endpoint=self.table_endpoint,
                     table_name=self.table_name,
                     credential=self.credential
                 )
@@ -98,25 +136,16 @@ class TaskStorageClient:
             logger.error(f"Error getting table client: {e}", exc_info=True)
             raise
     
-    def _serialize_json_fields(self, entity):
-        """Serialize JSON fields for storage"""
-        serialized = dict(entity)
-        for key, value in serialized.items():
-            if isinstance(value, (dict, list)):
-                serialized[key] = json.dumps(value)
-        return serialized
-    
-    def _deserialize_json_fields(self, entity):
-        """Deserialize JSON fields from storage"""
-        deserialized = dict(entity)
-        for key, value in deserialized.items():
-            if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
-                try:
-                    deserialized[key] = json.loads(value)
-                except json.JSONDecodeError:
-                    # Not valid JSON, keep as string
-                    pass
-        return deserialized
+    def _get_blob_client(self, blob_name):
+        """Get a blob client for the specified blob"""
+        try:
+            return self.blob_service.get_blob_client(
+                container=self.container_name,
+                blob=blob_name
+            )
+        except Exception as e:
+            logger.error(f"Error getting blob client: {e}", exc_info=True)
+            raise
     
     def _retry_operation(self, operation_name, operation_func, *args, **kwargs):
         """
@@ -151,10 +180,62 @@ class TaskStorageClient:
         
         # If we reached here, all retries failed
         raise last_exception
+    
+    def _store_data_in_blob(self, task_id, field_name, data):
+        """
+        Store data in a blob
         
+        Args:
+            task_id: ID of the task
+            field_name: Name of the field (used in blob name)
+            data: Data to store (dict/list will be JSON serialized, other types stored as string)
+            
+        Returns:
+            Blob name
+        """
+        blob_name = f"{task_id}/{field_name}.json"
+        blob_client = self._get_blob_client(blob_name)
+        
+        # Convert data to JSON string if it's a dict or list
+        if isinstance(data, (dict, list)):
+            content = json.dumps(data)
+        else:
+            content = str(data)
+        
+        def _upload_blob():
+            blob_client.upload_blob(content, overwrite=True)
+            return blob_name
+        
+        return self._retry_operation(f"Upload blob {blob_name}", _upload_blob)
+    
+    def _get_data_from_blob(self, blob_name):
+        """
+        Get data from a blob
+        
+        Args:
+            blob_name: Name of the blob to retrieve
+            
+        Returns:
+            Data from the blob (deserialized from JSON if possible)
+        """
+        blob_client = self._get_blob_client(blob_name)
+        
+        def _download_blob():
+            download_stream = blob_client.download_blob()
+            content = download_stream.readall().decode('utf-8')
+            
+            # Try to deserialize from JSON
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                # Not valid JSON, return as string
+                return content
+        
+        return self._retry_operation(f"Download blob {blob_name}", _download_blob)
+    
     def create_task(self, task_data):
         """
-        Create a new task in Table Storage
+        Create a new task
         
         Args:
             task_data: Dictionary containing task data
@@ -162,40 +243,58 @@ class TaskStorageClient:
         Returns:
             The task_id of the created task
         """
-        
-        # Create entity for Table Storage
+        # Create entity for Table Storage (metadata only)
+        task_id = task_data['task_id']
         entity = {
             "PartitionKey": "task",
             "created_by": task_data.get('created_by', 'system'),
-            "RowKey": task_data['task_id'],
+            "RowKey": task_id,
             "status": task_data['status'],
             "progress": task_data['progress'],
-            "messages": json.dumps(task_data.get("messages", [])),
-            "thought_process": json.dumps([]),
-            "tool_calls": json.dumps([]),
             "created_at": task_data['created_at'],
             "updated_at": task_data['updated_at'],
         }
         
-        # Add other fields if present
+        # Add error field if present (this is usually small)
         if "error" in task_data:
             entity["error"] = task_data["error"]
         
+        # Store large fields in blobs
+        large_fields = {
+            "messages": task_data.get("messages", []),
+            "thought_process": task_data.get("thought_process", []),
+            "tool_calls": task_data.get("tool_calls", []),
+        }
+        
+        # Store result in blob if present
         if "result" in task_data:
-            entity["result"] = json.dumps(task_data["result"])
+            large_fields["result"] = task_data["result"]
         
-        task_id = entity["RowKey"]
-        logger.info(f"Creating task {task_id} in Table Storage")
+        # Add blob references to the entity
+        blob_references = {}
         
-        def _create_entity():
+        logger.info(f"Creating task {task_id}")
+        
+        def _create_task():
+            # First store large fields in blobs
+            for field_name, field_data in large_fields.items():
+                if field_data:  # Only store non-empty data
+                    blob_name = self._store_data_in_blob(task_id, field_name, field_data)
+                    blob_references[field_name] = blob_name
+            
+            # Add blob references to entity
+            entity["blob_references"] = json.dumps(blob_references)
+            
+            # Create entity in table
             table_client = self._get_table_client()
             table_client.create_entity(entity)
+            
             return task_id
         
         try:
-            return self._retry_operation(f"Create task {task_id}", _create_entity)
+            return self._retry_operation(f"Create task {task_id}", _create_task)
         except Exception as e:
-            logger.error(f"Error creating task {task_id} in Table Storage after retries: {e}", exc_info=True)
+            logger.error(f"Error creating task {task_id} after retries: {e}", exc_info=True)
             raise
     
     def get_task(self, task_id):
@@ -210,20 +309,36 @@ class TaskStorageClient:
         """
         logger.debug(f"Getting task {task_id}")
         
-        def _get_entity():
+        def _get_task():
+            # Get metadata from table
             table_client = self._get_table_client()
             entity = table_client.get_entity("task", task_id)
-            return self._deserialize_json_fields(entity)
+            
+            # Create task data dictionary
+            task_data = dict(entity)
+            
+            # Load blob references
+            blob_references = json.loads(entity.get("blob_references", "{}"))
+            
+            # Load data from blobs
+            for field_name, blob_name in blob_references.items():
+                task_data[field_name] = self._get_data_from_blob(blob_name)
+            
+            # Remove blob_references field from result
+            if "blob_references" in task_data:
+                del task_data["blob_references"]
+            
+            return task_data
         
         try:
-            return self._retry_operation(f"Get task {task_id}", _get_entity)
+            return self._retry_operation(f"Get task {task_id}", _get_task)
         except Exception as e:
             logger.warning(f"Task {task_id} not found or error retrieving: {e}")
             return None
     
     def update_task(self, task_id, updates):
         """
-        Update a task in Table Storage
+        Update a task
         
         Args:
             task_id: ID of the task to update
@@ -234,7 +349,7 @@ class TaskStorageClient:
         """
         logger.info(f"Updating task {task_id} with fields: {list(updates.keys())}")
         
-        def _update_entity():
+        def _update_task():
             table_client = self._get_table_client()
             
             # Get current entity
@@ -243,19 +358,39 @@ class TaskStorageClient:
             # Update timestamp
             entity["updated_at"] = datetime.now().isoformat()
             
-            # Update fields
+            # Load blob references
+            blob_references = json.loads(entity.get("blob_references", "{}"))
+            
+            # Process updates
+            table_updates = {}
+            blob_updates = {}
+            
             for key, value in updates.items():
-                if isinstance(value, (dict, list)):
-                    entity[key] = json.dumps(value)
+                # Check if the field should be stored in a blob
+                if key in ["messages", "thought_process", "tool_calls", "result"] or isinstance(value, (dict, list)) and len(json.dumps(value)) > 30000:
+                    # Store in blob
+                    blob_updates[key] = value
                 else:
-                    entity[key] = value
+                    # Store in table
+                    table_updates[key] = value
+            
+            # Update blobs
+            for field_name, field_data in blob_updates.items():
+                blob_name = self._store_data_in_blob(task_id, field_name, field_data)
+                blob_references[field_name] = blob_name
+            
+            # Update entity with table updates and blob references
+            for key, value in table_updates.items():
+                entity[key] = value
+            
+            entity["blob_references"] = json.dumps(blob_references)
             
             # Update entity in table
             table_client.update_entity(entity)
             return True
         
         try:
-            return self._retry_operation(f"Update task {task_id}", _update_entity)
+            return self._retry_operation(f"Update task {task_id}", _update_task)
         except Exception as e:
             logger.error(f"Error updating task {task_id} after retries: {e}", exc_info=True)
             return False
@@ -302,17 +437,16 @@ class TaskStorageClient:
         logger.debug(f"Adding thought to task {task_id}")
         
         def _add_thought():
-            table_client = self._get_table_client()
-            
-            # Get current entity
-            entity = table_client.get_entity("task", task_id)
+            # Get task data
+            task_data = self.get_task(task_id)
+            if not task_data:
+                raise ValueError(f"Task {task_id} not found")
             
             # Update timestamp
             timestamp = datetime.now().isoformat()
-            entity["updated_at"] = timestamp
             
             # Get current thought process
-            thought_process = json.loads(entity.get("thought_process", "[]"))
+            thought_process = task_data.get("thought_process", [])
             
             # Add new thought
             thought_process.append({
@@ -320,11 +454,12 @@ class TaskStorageClient:
                 "content": thought
             })
             
-            # Update entity
-            entity["thought_process"] = json.dumps(thought_process)
-            table_client.update_entity(entity)
-            return True
-            
+            # Update task
+            return self.update_task(task_id, {
+                "thought_process": thought_process,
+                "updated_at": timestamp
+            })
+        
         try:
             return self._retry_operation(f"Add thought to task {task_id}", _add_thought)
         except Exception as e:
@@ -345,17 +480,16 @@ class TaskStorageClient:
         logger.debug(f"Adding tool calls to task {task_id}")
         
         def _add_tool_calls():
-            table_client = self._get_table_client()
-            
-            # Get current entity
-            entity = table_client.get_entity("task", task_id)
+            # Get task data
+            task_data = self.get_task(task_id)
+            if not task_data:
+                raise ValueError(f"Task {task_id} not found")
             
             # Update timestamp
             timestamp = datetime.now().isoformat()
-            entity["updated_at"] = timestamp
             
             # Get current tool calls
-            tool_calls = json.loads(entity.get("tool_calls", "[]"))
+            tool_calls = task_data.get("tool_calls", [])
             
             # Build a map of existing tool calls by ID
             existing_calls = {
@@ -373,10 +507,14 @@ class TaskStorageClient:
                 }
             
             # Replace the tool_calls with deduplicated values
-            entity["tool_calls"] = json.dumps(list(existing_calls.values()))
-            table_client.update_entity(entity)
-            return True
+            new_tool_calls = list(existing_calls.values())
             
+            # Update task
+            return self.update_task(task_id, {
+                "tool_calls": new_tool_calls,
+                "updated_at": timestamp
+            })
+        
         try:
             return self._retry_operation(f"Add tool calls to task {task_id}", _add_tool_calls)
         except Exception as e:
@@ -406,7 +544,7 @@ class TaskStorageClient:
             max_results: Maximum number of results to return
             
         Returns:
-            List of task dictionaries
+            List of task dictionaries (metadata only without blob data)
         """
         logger.info(f"Listing tasks created by '{created_by}' (max: {max_results})")
         
@@ -417,14 +555,19 @@ class TaskStorageClient:
             query_filter = f"PartitionKey eq 'task' and created_by eq '{created_by}'"
             entities = table_client.query_entities(query_filter, results_per_page=max_results)
             
-            # Deserialize and return tasks
+            # Process entities
             tasks = []
             for entity in entities:
-                deserialized = self._deserialize_json_fields(entity)
-                tasks.append(deserialized)
+                task_data = dict(entity)
+                
+                # Remove blob_references field
+                if "blob_references" in task_data:
+                    del task_data["blob_references"]
+                
+                tasks.append(task_data)
             
             return tasks
-            
+        
         try:
             return self._retry_operation(f"List tasks by '{created_by}'", _list_tasks)
         except Exception as e:
@@ -433,7 +576,7 @@ class TaskStorageClient:
     
     def delete_task(self, task_id):
         """
-        Delete a task
+        Delete a task and its associated blobs
         
         Args:
             task_id: ID of the task to delete
@@ -444,10 +587,24 @@ class TaskStorageClient:
         logger.info(f"Deleting task {task_id}")
         
         def _delete_task():
+            # Get task metadata to find blob references
             table_client = self._get_table_client()
+            entity = table_client.get_entity("task", task_id)
+            
+            # Delete blobs if present
+            if "blob_references" in entity:
+                blob_references = json.loads(entity["blob_references"])
+                for blob_name in blob_references.values():
+                    blob_client = self._get_blob_client(blob_name)
+                    try:
+                        blob_client.delete_blob()
+                    except Exception as e:
+                        logger.warning(f"Error deleting blob {blob_name}: {e}")
+            
+            # Delete task from table
             table_client.delete_entity("task", task_id)
             return True
-            
+        
         try:
             return self._retry_operation(f"Delete task {task_id}", _delete_task)
         except Exception as e:
