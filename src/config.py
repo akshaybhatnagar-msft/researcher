@@ -20,7 +20,7 @@ USE_GROUNDING_WITH_BING = os.environ.get("USE_GROUNDING_WITH_BING", "False") == 
 
 # Default credential for Azure
 def get_azure_credential():
-    isLocal = os.environ.get("IS_LOCAL", "true").lower() == "true"
+    isLocal = os.environ.get("IS_LOCAL", "false").lower() == "true"
     try:
         if not isLocal:
             # Only use ManagedIdentityCredential in non-local environments
